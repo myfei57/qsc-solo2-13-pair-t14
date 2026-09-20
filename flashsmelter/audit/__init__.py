@@ -78,6 +78,20 @@ class AuditLog:
         entry = self._store.append(AUDIT_STREAM, payload)
         return self._to_event(entry)
 
+    def read_events(self, *, since_seq: int = 0, limit: int = 1000) -> list[AuditEvent]:
+        """按序号直读审计事件（供外发收录与三方对账，不做过滤）。"""
+
+        entries = self._store.read_stream(AUDIT_STREAM, since_seq=since_seq, limit=limit)
+        return [self._to_event(entry) for entry in entries]
+
+    def read_events_forward(self, *, since_seq: int, limit: int = 1000) -> list[AuditEvent]:
+        """游标式正向翻页：返回 ``since_seq`` 之后最前 ``limit`` 条。"""
+
+        entries = self._store.read_stream(
+            AUDIT_STREAM, since_seq=since_seq, limit=limit, forward=True
+        )
+        return [self._to_event(entry) for entry in entries]
+
     def query(
         self,
         *,

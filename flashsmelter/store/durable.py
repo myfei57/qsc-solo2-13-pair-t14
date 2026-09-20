@@ -229,7 +229,15 @@ class DurableStore:
         limit: int = 100,
         since_seq: int = 0,
         verify: bool = True,
+        forward: bool = False,
     ) -> list[JournalEntry]:
+        """读取流水。
+
+        默认返回 ``since_seq`` 之后的**最后** ``limit`` 条（面向「看最近记录」
+        的查询）；``forward=True`` 时返回**最前** ``limit`` 条，供游标式增量
+        扫描（如发件箱收录）按序号正向翻页，积压很大时也不会漏读中间段。
+        """
+
         if limit < 1:
             raise ValidationError("limit 必须为正", details={"limit": limit})
         segments = validate_key(stream)
@@ -270,6 +278,8 @@ class DurableStore:
                         payload=payload,
                     )
                 )
+                if forward and len(entries) >= limit:
+                    break
         if len(entries) > limit:
             entries = entries[-limit:]
         return entries

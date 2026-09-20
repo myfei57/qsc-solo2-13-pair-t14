@@ -14,6 +14,13 @@ from .component import Component, ensure_actor
 from .conc import ConcentrateSystem
 from .config import Settings
 from .conv import Converter
+from .egress import (
+    CriticalPolicy,
+    EgressPump,
+    EgressService,
+    TargetDispatcher,
+    WebhookSink,
+)
 from .errors import ValidationError
 from .furnace import FlashFurnace
 from .matte import MatteTap
@@ -81,6 +88,7 @@ class Application:
         self.slag.bind_matte(self.matte)
         self.matte.bind_converter(self.conv)
         self.oxygen.bind_feed_port(self.conc)
+        self._build_egress()
         self.components: tuple[Component, ...] = (
             self.furnace,
             self.burner,
@@ -93,6 +101,49 @@ class Application:
             self.waste,
         )
         self._by_name: dict[str, Component] = {component.name: component for component in self.components}
+
+    # ------------------------------------------------------------- 事件外发
+    def _build_egress(self) -> None:
+        policy = CriticalPolicy(
+            self.namespace.prefix, patterns=self.settings.egress_action_patterns()
+        )
+        self.egress = EgressService(
+            self.store,
+            namespace=self.namespace.prefix,
+            clock=self.clock,
+            policy=policy,
+        )
+        self.egress.bind_audit(self.audit)
+        if self.settings.egress_enabled:
+            for name, endpoint in self.settings.egress_target_specs():
+                sink = WebhookSink(endpoint)
+                dispatcher = TargetDispatcher(
+                    name,
+                    sink,
+                    self.store,
+                    namespace=self.namespace.prefix,
+                    clock=self.clock,
+                    timeout=self.settings.egress_timeout_seconds,
+                    max_attempts=self.settings.egress_max_attempts,
+                )
+                self.egress.add_target(dispatcher)
+        self._pump: EgressPump | None = None
+
+    def start_egress_pump(self) -> EgressPump | None:
+        """serve 长驻时启动后台补发泵；CLI 一次性命令不需要。"""
+
+        if self._pump is not None or not self.settings.egress_enabled:
+            return self._pump
+        self._pump = EgressPump(
+            self.egress, interval_seconds=self.settings.egress_pump_interval_seconds
+        )
+        self._pump.start()
+        return self._pump
+
+    def stop_egress_pump(self) -> None:
+        if self._pump is not None:
+            self._pump.stop()
+            self._pump = None
 
     # ------------------------------------------------------------- 动作注册
     def _build_actions(self) -> dict[str, ActionHandler]:
@@ -539,7 +590,21 @@ class Application:
         except KeyError as exc:
             raise ValidationError("未知动作", details={"action": action, "known": sorted(self._actions)}) from exc
         parsed = params if isinstance(params, Params) else Params(params, source=source)
-        return handler(parsed)
+        try:
+            return handler(parsed)
+        finally:
+            # 审计已在动作包装器里落盘（成功、拒绝、失败都有），这里把新关键
+            # 事件收进发件箱；收录失败绝不能影响工艺动作的返回。
+            self._ingest_egress()
+
+    def _ingest_egress(self) -> None:
+        try:
+            admitted = self.egress.ingest()
+        except Exception:
+            self.metrics.inc("egress.ingest_failed")
+            return
+        if admitted:
+            self.metrics.inc("egress.ingested", len(admitted))
 
     def state(self) -> Mapping[str, Any]:
         service = dict(self.ctx.describe())
@@ -577,6 +642,25 @@ class Application:
         payload["components"] = {component.name: component.status()["state"] for component in self.components}
         payload["audit_length"] = self.audit.length()
         return payload
+
+    # ------------------------------------------------------------- 外发视图
+    def egress_status(self) -> Mapping[str, Any]:
+        return self.egress.status()
+
+    def egress_events(self, *, limit: int = 100) -> list[Mapping[str, Any]]:
+        return self.egress.events(limit=limit)
+
+    def egress_attempts(self, target: str, *, limit: int = 50) -> list[Mapping[str, Any]]:
+        return self.egress.attempts(target, limit=limit)
+
+    def egress_pump(self, *, force: bool = False) -> Mapping[str, Any]:
+        return self.egress.pump_once(force=force)
+
+    def egress_retry_dead(self, target: str) -> Mapping[str, Any]:
+        return self.egress.retry_dead(target)
+
+    def egress_reconcile(self) -> Mapping[str, Any]:
+        return self.egress.reconcile()
 
     def describe_actions(self) -> list[Mapping[str, Any]]:
         return [

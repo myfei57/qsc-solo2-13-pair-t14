@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -86,12 +87,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     console = ConsoleApp(application)
     server = ConsoleServer(console, host=settings.host, port=settings.port)
     host, port = server.start()
+    application.start_egress_pump()
     print(f"FlashSmelter 控制台已启动：http://{host}:{port}/api/state（Ctrl+C 停止）", flush=True)
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        application.stop_egress_pump()
         server.stop()
     return 0
 
@@ -151,6 +155,32 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 2
 
 
+def _cmd_egress(args: argparse.Namespace) -> int:
+    application = Application(_build_settings(args))
+    sub = args.egress_command
+    if sub == "status":
+        _print(application.egress_status())
+        return 0
+    if sub == "events":
+        events = application.egress_events(limit=args.limit)
+        _print({"count": len(events), "events": events})
+        return 0
+    if sub == "pump":
+        _print(application.egress_pump(force=args.force))
+        return 0
+    if sub == "retry":
+        _print(application.egress_retry_dead(args.target))
+        return 0
+    if sub == "attempts":
+        _print({"target": args.target, "attempts": application.egress_attempts(args.target, limit=args.limit)})
+        return 0
+    if sub == "reconcile":
+        report = application.egress_reconcile()
+        _print(report)
+        return 0 if report.get("ok") else 2
+    raise ValidationError("未知外发子命令", details={"command": sub})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flashsmelter",
@@ -194,6 +224,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    egress = subparsers.add_parser("egress", help="关键事件外发：补发、查询与对账")
+    egress_sub = egress.add_subparsers(dest="egress_command", required=True)
+    egress_status = egress_sub.add_parser("status", help="查看各目标水位、待发与死信")
+    egress_status.set_defaults(func=_cmd_egress)
+    egress_events = egress_sub.add_parser("events", help="列出关键事件与逐目标投递状态")
+    egress_events.add_argument("--limit", type=int, default=100)
+    egress_events.set_defaults(func=_cmd_egress)
+    egress_pump = egress_sub.add_parser("pump", help="立即收录并补发一轮（--force 忽略退避立即重试）")
+    egress_pump.add_argument("--force", action="store_true", help="忽略退避时间，立即重发 pending/dead")
+    egress_pump.set_defaults(func=_cmd_egress)
+    egress_retry = egress_sub.add_parser("retry", help="把某目标的死信重新放回投递")
+    egress_retry.add_argument("target", help="目标名称")
+    egress_retry.set_defaults(func=_cmd_egress)
+    egress_attempts = egress_sub.add_parser("attempts", help="查看某目标的逐次发送记录")
+    egress_attempts.add_argument("target", help="目标名称")
+    egress_attempts.add_argument("--limit", type=int, default=50)
+    egress_attempts.set_defaults(func=_cmd_egress)
+    egress_reconcile = egress_sub.add_parser("reconcile", help="审计 ↔ 发件箱 ↔ 已发送三方对账")
+    egress_reconcile.set_defaults(func=_cmd_egress)
 
     return parser
 

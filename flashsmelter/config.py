@@ -17,6 +17,15 @@ from .errors import ConfigurationError, ValidationError
 ENV_PREFIX = "FLASHSMELTER_"
 
 
+def _parse_bool(raw: str) -> bool:
+    lowered = raw.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"无法解析为布尔值: {raw!r}")
+
+
 def _read_env(environ: Mapping[str, str]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for name, caster in _ENV_FIELDS.items():
@@ -66,6 +75,13 @@ _ENV_FIELDS: dict[str, Any] = {
     "furnace_purge_seconds": float,
     "furnace_min_smelt_dwell_seconds": float,
     "furnace_transition_timeout_seconds": float,
+    # 关键事件外发。
+    "egress_enabled": _parse_bool,
+    "egress_targets": str,
+    "egress_critical_actions": str,
+    "egress_pump_interval_seconds": float,
+    "egress_timeout_seconds": float,
+    "egress_max_attempts": int,
 }
 
 
@@ -120,6 +136,15 @@ class Settings:
     furnace_purge_seconds: float = 15.0
     furnace_min_smelt_dwell_seconds: float = 45.0
     furnace_transition_timeout_seconds: float = 600.0
+
+    # 关键事件外发：egress_targets 形如
+    # ``上级=url,调度=url``；留空表示只收录不外发（断网演练/单机部署）。
+    egress_enabled: bool = True
+    egress_targets: str = ""
+    egress_critical_actions: str = ""
+    egress_pump_interval_seconds: float = 5.0
+    egress_timeout_seconds: float = 5.0
+    egress_max_attempts: int = 0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> "Settings":
@@ -242,6 +267,58 @@ class Settings:
                     "purge": self.furnace_purge_seconds,
                 },
             )
+        if self.egress_pump_interval_seconds <= 0:
+            raise ValidationError(
+                "外发泵间隔必须为正",
+                details={"interval": self.egress_pump_interval_seconds},
+            )
+        if self.egress_timeout_seconds <= 0:
+            raise ValidationError(
+                "外发请求超时必须为正", details={"timeout": self.egress_timeout_seconds}
+            )
+        if self.egress_max_attempts < 0:
+            raise ValidationError(
+                "外发最大尝试次数不能为负（0 表示无限重试）",
+                details={"max_attempts": self.egress_max_attempts},
+            )
+        self.egress_target_specs()
+
+    def egress_target_specs(self) -> list[tuple[str, str]]:
+        """解析 ``name=url,name=url`` 形式的外发目标清单。"""
+
+        if not self.egress_targets.strip():
+            return []
+        specs: list[tuple[str, str]] = []
+        for chunk in self.egress_targets.split(","):
+            item = chunk.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValidationError(
+                    "外发目标必须形如 名称=URL", details={"item": item}
+                )
+            name, endpoint = (part.strip() for part in item.split("=", 1))
+            if not name or not endpoint:
+                raise ValidationError("外发目标的名称与 URL 不能为空", details={"item": item})
+            if not endpoint.startswith(("http://", "https://")):
+                raise ValidationError(
+                    "外发目标 URL 必须是 http(s) 地址", details={"target": name, "url": endpoint}
+                )
+            specs.append((name, endpoint))
+        if len({name for name, _ in specs}) != len(specs):
+            raise ValidationError("外发目标名称重复", details={"targets": [name for name, _ in specs]})
+        return specs
+
+    def egress_action_patterns(self) -> frozenset[str] | None:
+        """``furnace.*,burner.trip`` 形式的自定义关键动作；空串表示用默认目录。"""
+
+        text = self.egress_critical_actions.strip()
+        if not text:
+            return None
+        patterns = frozenset(part.strip() for part in text.split(",") if part.strip())
+        if not patterns:
+            raise ValidationError("关键动作清单不能为空")
+        return patterns
 
     def with_root(self, root: Path | str) -> "Settings":
         updated = replace(self, root=Path(root))

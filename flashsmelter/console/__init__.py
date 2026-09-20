@@ -71,7 +71,10 @@ class Router:
     def resolve(
         self, method: str, path: str
     ) -> tuple[Callable[[Mapping[str, str], Mapping[str, Any]], Mapping[str, Any]], Mapping[str, str]]:
-        segments = tuple(part for part in path.strip("/").split("/") if part)
+        from urllib.parse import unquote
+
+        raw_segments = tuple(part for part in path.strip("/").split("/") if part)
+        segments = tuple(unquote(part) for part in raw_segments)
         method = method.upper()
         allowed: set[str] = set()
         for route in self._routes:
@@ -115,6 +118,12 @@ class ConsoleApp:
         self.router.add("GET", "/api/components", self._components)
         self.router.add("GET", "/api/components/{component}", self._component)
         self.router.add("GET", "/api/zones", self._zones)
+        self.router.add("GET", "/api/egress/status", self._egress_status)
+        self.router.add("GET", "/api/egress/events", self._egress_events)
+        self.router.add("GET", "/api/egress/targets/{target}/attempts", self._egress_attempts)
+        self.router.add("POST", "/api/egress/pump", self._egress_pump)
+        self.router.add("POST", "/api/egress/targets/{target}/retry", self._egress_retry)
+        self.router.add("GET", "/api/egress/reconcile", self._egress_reconcile)
         for name in self.application.actions:
             component, verb = name.split(".", 1)
             self.router.add("POST", f"/api/{component}/{verb}", self._action_handler(name))
@@ -211,6 +220,39 @@ class ConsoleApp:
             "namespace": self.application.namespace.prefix,
             "zones": {zone: sorted(names) for zone, names in sorted(zones.items())},
         }
+
+    # ------------------------------------------------------------- 事件外发
+    def _egress_status(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self.application.egress_status()
+
+    def _egress_events(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:egress-events")
+        limit = parsed.integer("limit", required=False, default=100, minimum=1, maximum=1000)
+        events = self.application.egress_events(limit=limit)
+        return {"count": len(events), "events": events}
+
+    def _egress_attempts(self, path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:egress-attempts")
+        limit = parsed.integer("limit", required=False, default=50, minimum=1, maximum=500)
+        attempts = self.application.egress_attempts(path["target"], limit=limit)
+        return {"target": path["target"], "count": len(attempts), "attempts": attempts}
+
+    def _egress_pump(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:egress-pump")
+        force = parsed.boolean("force", required=False, default=False)
+        return self.application.egress_pump(force=force)
+
+    def _egress_retry(self, path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"target": path["target"], "result": self.application.egress_retry_dead(path["target"])}
+
+    def _egress_reconcile(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self.application.egress_reconcile()
 
     # ------------------------------------------------------------------ 分发
     def handle(
