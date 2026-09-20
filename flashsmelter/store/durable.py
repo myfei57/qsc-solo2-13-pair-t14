@@ -279,6 +279,42 @@ class DurableStore:
         path = self.journal_root.joinpath(*segments).with_suffix(".jsonl")
         return self._last_sequence(path)
 
+    def read_stream_entry(self, stream: str, seq: int, *, verify: bool = True) -> JournalEntry | None:
+        """按序号点读一条流水行；不存在返回 None。"""
+
+        segments = validate_key(stream)
+        path = self.journal_root.joinpath(*segments).with_suffix(".jsonl")
+        if not path.exists():
+            return None
+        with self._lock, path.open("rb") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                text = raw.decode("utf-8").strip()
+                if not text:
+                    continue
+                parsed = json.loads(text)
+                current_seq = int(parsed.get("seq", 0))
+                if current_seq < seq:
+                    continue
+                if current_seq > seq:
+                    return None
+                written_at = str(parsed.get("written_at", ""))
+                payload = parsed.get("payload", {})
+                if verify:
+                    expected = checksum_of(seq, written_at, payload)
+                    if expected != parsed.get("checksum"):
+                        raise IntegrityError(
+                            "流水行校验和不匹配",
+                            details={"stream": stream, "line": line_number, "seq": seq},
+                        )
+                return JournalEntry(
+                    stream=stream,
+                    seq=seq,
+                    written_at=written_at,
+                    checksum=str(parsed.get("checksum", "")),
+                    payload=payload,
+                )
+        return None
+
     def list_streams(self) -> list[str]:
         streams: list[str] = []
         for path in sorted(self.journal_root.rglob("*.jsonl")):

@@ -23,6 +23,21 @@ def _read_env(environ: Mapping[str, str]) -> dict[str, Any]:
         raw = environ.get(ENV_PREFIX + name.upper())
         if raw is None or raw == "":
             continue
+        if name == "outbox_enabled":
+            lowered = raw.strip().lower()
+            if lowered in _TRUE_ENV:
+                values[name] = True
+            elif lowered in _FALSE_ENV:
+                values[name] = False
+            else:
+                raise ConfigurationError(
+                    f"环境变量 {ENV_PREFIX}OUTBOX_ENABLED 不是布尔取值",
+                    details={"value": raw},
+                )
+            continue
+        if name == "outbox_key_events":
+            values[name] = tuple(item.strip() for item in raw.split(",") if item.strip())
+            continue
         try:
             values[name] = caster(raw)
         except (TypeError, ValueError) as exc:
@@ -31,6 +46,39 @@ def _read_env(environ: Mapping[str, str]) -> dict[str, Any]:
                 details={"value": raw, "expected": caster.__name__},
             ) from exc
     return values
+
+
+_TRUE_ENV = {"true", "1", "yes", "on", "y"}
+_FALSE_ENV = {"false", "0", "no", "off", "n"}
+
+# 关键事件选择规则：``组件.动作``、``组件.*`` 或 ``*``（匹配所有动作）；
+# 另支持按结果过滤的后缀 ``:ok`` / ``:rejected`` / ``:failed``，缺省只外发成功事件。
+_OUTCOME_SUFFIXES = (":ok", ":rejected", ":failed")
+
+
+def _validate_event_pattern(pattern: str) -> None:
+    text = pattern
+    outcome = ""
+    for suffix in _OUTCOME_SUFFIXES:
+        if text.endswith(suffix):
+            text, outcome = text[: -len(suffix)], suffix
+            break
+    if not text or text == "*":
+        return
+    if text.endswith(".*"):
+        component = text[:-2]
+        if component and all(ch.isalnum() or ch in "_-" for ch in component):
+            return
+    elif "." in text:
+        component, verb = text.split(".", 1)
+        if component and verb and all(
+            ch.isalnum() or ch in "_-" for token in (component, verb) for ch in token
+        ):
+            return
+    raise ValidationError(
+        "关键事件规则不合法",
+        details={"pattern": pattern, "expected": "component.action[:outcome]、component.* 或 *"},
+    )
 
 
 _ENV_FIELDS: dict[str, Any] = {
@@ -66,6 +114,14 @@ _ENV_FIELDS: dict[str, Any] = {
     "furnace_purge_seconds": float,
     "furnace_min_smelt_dwell_seconds": float,
     "furnace_transition_timeout_seconds": float,
+    "outbox_enabled": str,
+    "outbox_endpoint": str,
+    "outbox_key_events": str,
+    "outbox_poll_interval_seconds": float,
+    "outbox_retry_backoff_seconds": float,
+    "outbox_retry_backoff_max_seconds": float,
+    "outbox_max_attempts": int,
+    "outbox_request_timeout_seconds": float,
 }
 
 
@@ -120,6 +176,17 @@ class Settings:
     furnace_purge_seconds: float = 15.0
     furnace_min_smelt_dwell_seconds: float = 45.0
     furnace_transition_timeout_seconds: float = 600.0
+
+    # 关键事件外发（事务发件箱）。
+    # endpoint 为空表示功能关闭：事件仍正常入箱留存，但不进行网络投递。
+    outbox_enabled: bool = True
+    outbox_endpoint: str = ""
+    outbox_key_events: tuple[str, ...] = ()
+    outbox_poll_interval_seconds: float = 2.0
+    outbox_retry_backoff_seconds: float = 5.0
+    outbox_retry_backoff_max_seconds: float = 300.0
+    outbox_max_attempts: int = 20
+    outbox_request_timeout_seconds: float = 5.0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> "Settings":
@@ -242,6 +309,33 @@ class Settings:
                     "purge": self.furnace_purge_seconds,
                 },
             )
+        if self.outbox_poll_interval_seconds <= 0:
+            raise ValidationError(
+                "发件箱扫描间隔必须为正",
+                details={"poll": self.outbox_poll_interval_seconds},
+            )
+        if self.outbox_retry_backoff_seconds <= 0:
+            raise ValidationError(
+                "发件箱重试退避必须为正",
+                details={"backoff": self.outbox_retry_backoff_seconds},
+            )
+        if self.outbox_retry_backoff_max_seconds < self.outbox_retry_backoff_seconds:
+            raise ValidationError(
+                "发件箱退避上限不得小于初始退避",
+                details={
+                    "max": self.outbox_retry_backoff_max_seconds,
+                    "base": self.outbox_retry_backoff_seconds,
+                },
+            )
+        if self.outbox_max_attempts < 1:
+            raise ValidationError("发件箱最大尝试次数必须为正", details={"max_attempts": self.outbox_max_attempts})
+        if self.outbox_request_timeout_seconds <= 0:
+            raise ValidationError(
+                "外发请求超时必须为正",
+                details={"timeout": self.outbox_request_timeout_seconds},
+            )
+        for pattern in self.outbox_key_events:
+            _validate_event_pattern(pattern)
 
     def with_root(self, root: Path | str) -> "Settings":
         updated = replace(self, root=Path(root))

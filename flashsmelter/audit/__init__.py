@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..errors import ValidationError
 from ..ns import Namespace
@@ -17,6 +18,12 @@ from ..store import DurableStore, JournalEntry
 AUDIT_STREAM = "audit/events"
 
 OUTCOMES = ("ok", "rejected", "failed")
+
+LOGGER = logging.getLogger("flashsmelter.audit")
+
+# 审计落盘后的订阅者签名：拿到刚 fsync 的流水行。钩子异常只记录、绝不回抛，
+# 外发组件自身故障不能挡住工艺动作（发件箱另有增量扫描兜底）。
+AuditSink = Callable[[JournalEntry], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +37,7 @@ class AuditEvent:
     outcome: str
     correlation_id: str
     details: Mapping[str, Any]
+    checksum: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +50,7 @@ class AuditEvent:
             "outcome": self.outcome,
             "correlation_id": self.correlation_id,
             "details": dict(self.details),
+            "checksum": self.checksum,
         }
 
 
@@ -52,6 +61,12 @@ class AuditLog:
         self._store = store
         self._namespace = namespace
         self._clock = clock
+        self._sinks: list[AuditSink] = []
+
+    def add_sink(self, sink: AuditSink) -> None:
+        """注册一个审计落盘后的订阅者（如发件箱即时入箱）。"""
+
+        self._sinks.append(sink)
 
     def record(
         self,
@@ -76,6 +91,23 @@ class AuditLog:
             "details": dict(details or {}),
         }
         entry = self._store.append(AUDIT_STREAM, payload)
+        event = self.event_from_entry(entry)
+        self._dispatch(entry)
+        return event
+
+    def _dispatch(self, entry: JournalEntry) -> None:
+        for sink in tuple(self._sinks):
+            try:
+                sink(entry)
+            except Exception:
+                LOGGER.exception(
+                    "审计订阅者处理失败，等待发件箱增量扫描补齐",
+                    extra={"seq": entry.seq},
+                )
+
+    def event_from_entry(self, entry: JournalEntry) -> AuditEvent:
+        """把一条流水行还原成审计事件（含该行校验和）。"""
+
         return self._to_event(entry)
 
     def query(
@@ -132,6 +164,7 @@ class AuditLog:
             outcome=str(payload.get("outcome", "ok")),
             correlation_id=str(payload.get("correlation_id", "")),
             details=payload.get("details", {}) or {},
+            checksum=entry.checksum,
         )
 
 

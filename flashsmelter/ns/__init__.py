@@ -27,6 +27,7 @@ ZONE_CATALOG: Mapping[str, str] = {
     "conv": "converter",
     "waste": "offgas",
     "audit": "control",
+    "outbox": "control",
     "store": "control",
     "console": "control",
 }

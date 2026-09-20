@@ -115,6 +115,13 @@ class ConsoleApp:
         self.router.add("GET", "/api/components", self._components)
         self.router.add("GET", "/api/components/{component}", self._component)
         self.router.add("GET", "/api/zones", self._zones)
+        self.router.add("GET", "/api/outbox", self._outbox_status)
+        self.router.add("GET", "/api/outbox/pending", self._outbox_pending)
+        self.router.add("GET", "/api/outbox/dead", self._outbox_dead)
+        self.router.add("GET", "/api/outbox/events", self._outbox_events)
+        self.router.add("GET", "/api/outbox/reconcile", self._outbox_reconcile)
+        self.router.add("POST", "/api/outbox/flush", self._outbox_flush)
+        self.router.add("POST", "/api/outbox/retry", self._outbox_retry)
         for name in self.application.actions:
             component, verb = name.split(".", 1)
             self.router.add("POST", f"/api/{component}/{verb}", self._action_handler(name))
@@ -211,6 +218,44 @@ class ConsoleApp:
             "namespace": self.application.namespace.prefix,
             "zones": {zone: sorted(names) for zone, names in sorted(zones.items())},
         }
+
+    # ------------------------------------------------------- 关键事件外发
+    def _outbox_status(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return dict(self.application.outbox_status())
+
+    def _outbox_pending(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:outbox")
+        limit = parsed.integer("limit", required=False, default=100, minimum=1, maximum=500)
+        pending = self.application.outbox_pending(limit=limit)
+        return {"count": len(pending), "pending": pending}
+
+    def _outbox_dead(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        dead = self.application.outbox_dead()
+        return {"count": len(dead), "dead": dead}
+
+    def _outbox_events(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:outbox")
+        limit = parsed.integer("limit", required=False, default=100, minimum=1, maximum=500)
+        events = self.application.outbox_events(limit=limit)
+        return {"count": len(events), "events": events}
+
+    def _outbox_reconcile(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return dict(self.application.outbox_reconcile())
+
+    def _outbox_flush(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"flushed": self.application.flush_outbox()}
+
+    def _outbox_retry(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:outbox")
+        audit_seq = parsed.integer("audit_seq", minimum=1)
+        record = self.application.revive_outbox_event(audit_seq)
+        return {"revived": record}
 
     # ------------------------------------------------------------------ 分发
     def handle(
@@ -322,7 +367,13 @@ def _build_handler(console: ConsoleApp) -> type[BaseHTTPRequestHandler]:
 
 
 class ConsoleServer:
-    """把控制台挂到线程化的 HTTP 服务上。"""
+    """把控制台挂到线程化的 HTTP 服务上。
+
+    两种用法：
+
+    * ``start()`` 起后台服务线程，用完 ``stop()``（测试与嵌入场景）；
+    * ``serve_forever()`` 阻塞当前线程直到中断（CLI），内部自动启停。
+    """
 
     def __init__(self, console: ConsoleApp, *, host: str, port: int) -> None:
         self.console = console
@@ -346,25 +397,37 @@ class ConsoleServer:
         self._thread.start()
         return self.address
 
-    def serve_forever(self) -> None:
-        self.start()
-        assert self._httpd is not None
+    def serve_forever(self, *, on_ready=None) -> None:
+        """在当前线程内启动并阻塞，直到 Ctrl+C。仅供 CLI 主线程使用。
+
+        ``on_ready(host, port)`` 在端口绑定成功后、开始服务前回调，用于打印提示。
+        """
+
+        handler = _build_handler(self.console)
+        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd.daemon_threads = True
+        host, port = self._httpd.server_address[:2]
+        if on_ready is not None:
+            on_ready(str(host), int(port))
         try:
-            while True:
-                time.sleep(0.5)
+            self._httpd.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:  # pragma: no cover - 人工中断
             LOGGER.info("收到中断信号，准备停止控制台")
         finally:
-            self.stop()
+            # 不能在 serve 所在线程调用 shutdown()（会死锁）；进程随后退出，
+            # 直接关闭监听套接字即可。
+            httpd, self._httpd = self._httpd, None
+            if httpd is not None:
+                httpd.server_close()
 
     def stop(self) -> None:
-        if self._httpd is not None:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
+        httpd, self._httpd = self._httpd, None
+        thread, self._thread = self._thread, None
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
 
 
 __all__ = ["ConsoleApp", "ConsoleServer", "Response", "Router", "Route"]

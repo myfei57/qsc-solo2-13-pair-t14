@@ -135,5 +135,28 @@ class ConsoleTest(unittest.TestCase):
         self.assertIn("conv", payload["zones"]["converter"])
 
 
+class ConsoleServeForeverTest(unittest.TestCase):
+    def test_start_stop_is_idempotent_and_reusable(self) -> None:
+        # 回归：stop() 被重复调用不得报错（CLI finally 与显式停止可能各调一次）。
+        from .helpers import make_app, make_root
+
+        console = ConsoleApp(make_app(root=make_root("flashsmelter-serve-")))
+        server = ConsoleServer(console, host="127.0.0.1", port=0)
+        host, port = server.start()
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=5) as response:
+                self.assertEqual(200, response.status)
+        finally:
+            server.stop()
+            server.stop()  # 重复停止必须安全
+        # 同一实例可以重新启动
+        host2, port2 = server.start()
+        try:
+            with urllib.request.urlopen(f"http://{host2}:{port2}/api/health", timeout=5) as response:
+                self.assertEqual(200, response.status)
+        finally:
+            server.stop()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

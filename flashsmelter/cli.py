@@ -85,14 +85,21 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     application = Application(settings)
     console = ConsoleApp(application)
     server = ConsoleServer(console, host=settings.host, port=settings.port)
-    host, port = server.start()
-    print(f"FlashSmelter 控制台已启动：http://{host}:{port}/api/state（Ctrl+C 停止）", flush=True)
+    relay_started = False
+
+    def _announce(host: str, port: int) -> None:
+        nonlocal relay_started
+        relay_started = application.start_relay()
+        if relay_started:
+            print(f"关键事件外发已启用：{settings.outbox_endpoint}（断网垫存、恢复续送）", flush=True)
+        elif settings.outbox_enabled:
+            print("关键事件仅本地入箱留存（未配置 FLASHSMELTER_OUTBOX_ENDPOINT，不外发）", flush=True)
+        print(f"FlashSmelter 控制台已启动：http://{host}:{port}/api/state（Ctrl+C 停止）", flush=True)
+
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        server.serve_forever(on_ready=_announce)
     finally:
-        server.stop()
+        application.stop_relay()
     return 0
 
 
@@ -151,6 +158,37 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 2
 
 
+def _cmd_outbox(args: argparse.Namespace) -> int:
+    application = Application(_build_settings(args))
+    command = getattr(args, "outbox_command", None)
+    if not command:
+        _print(application.outbox_status())
+        return 0
+    if command == "status":
+        _print(application.outbox_status())
+        return 0
+    if command == "flush":
+        _print({"flushed": application.flush_outbox()})
+        return 0
+    if command == "pending":
+        _print({"pending": application.outbox_pending(limit=args.limit)})
+        return 0
+    if command == "dead":
+        _print({"dead": application.outbox_dead()})
+        return 0
+    if command == "events":
+        _print({"events": application.outbox_events(limit=args.limit)})
+        return 0
+    if command == "retry":
+        _print({"revived": application.revive_outbox_event(args.audit_seq)})
+        return 0
+    if command == "reconcile":
+        report = application.outbox_reconcile()
+        _print(report)
+        return 0 if report.get("ok") else 2
+    raise ValidationError("未知的 outbox 子命令", details={"command": command})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flashsmelter",
@@ -194,6 +232,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    outbox = subparsers.add_parser("outbox", help="关键事件外发（事务发件箱）")
+    outbox.set_defaults(func=_cmd_outbox)
+    outbox_sub = outbox.add_subparsers(dest="outbox_command")
+    outbox_status = outbox_sub.add_parser("status", help="外发状态：已送/待发/死信/积压年龄")
+    outbox_status.set_defaults(func=_cmd_outbox)
+    outbox_flush = outbox_sub.add_parser("flush", help="立即补扫审计并投递一轮")
+    outbox_flush.set_defaults(func=_cmd_outbox)
+    outbox_pending = outbox_sub.add_parser("pending", help="列出还没送到的事件")
+    outbox_pending.add_argument("--limit", type=int, default=100)
+    outbox_pending.set_defaults(func=_cmd_outbox)
+    outbox_dead = outbox_sub.add_parser("dead", help="列出超过重试次数的死信")
+    outbox_dead.set_defaults(func=_cmd_outbox)
+    outbox_events = outbox_sub.add_parser("events", help="列出已入箱的关键事件信封摘要")
+    outbox_events.add_argument("--limit", type=int, default=100)
+    outbox_events.set_defaults(func=_cmd_outbox)
+    outbox_retry = outbox_sub.add_parser("retry", help="死信复位，按 audit_seq 重新投递")
+    outbox_retry.add_argument("audit_seq", type=int)
+    outbox_retry.set_defaults(func=_cmd_outbox)
+    outbox_reconcile = outbox_sub.add_parser("reconcile", help="审计流水与发件箱逐行对账")
+    outbox_reconcile.set_defaults(func=_cmd_outbox)
 
     return parser
 

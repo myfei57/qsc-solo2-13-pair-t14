@@ -18,6 +18,7 @@ from .errors import ValidationError
 from .furnace import FlashFurnace
 from .matte import MatteTap
 from .ns import Namespace
+from .outbox import HttpTransport, KeyEventSelector, Outbox, Relay
 from .oxygen import OxygenSystem
 from .params import Params
 from .runtime import Clock, Generation, Metrics, RuntimeContext
@@ -52,6 +53,7 @@ class Application:
             audit=self.audit,
         )
         self._build_components()
+        self._build_outbox()
         self._actions: dict[str, ActionHandler] = self._build_actions()
 
     # ------------------------------------------------------------- 组件装配
@@ -93,6 +95,91 @@ class Application:
             self.waste,
         )
         self._by_name: dict[str, Component] = {component.name: component for component in self.components}
+
+    # ------------------------------------------------------------- 事件外发
+    def _build_outbox(self) -> None:
+        settings = self.settings
+        selector = KeyEventSelector(settings.outbox_key_events or None)
+        self.outbox = Outbox(
+            self.store,
+            selector,
+            self.namespace,
+            self.clock,
+            event_decoder=self.audit.event_from_entry,
+            max_attempts=settings.outbox_max_attempts,
+        )
+        transport = None
+        if settings.outbox_enabled and settings.outbox_endpoint:
+            transport = HttpTransport(
+                settings.outbox_endpoint,
+                timeout_seconds=settings.outbox_request_timeout_seconds,
+                clock=self.clock,
+            )
+        self.relay = Relay(
+            self.outbox,
+            transport,
+            clock=self.clock,
+            metrics=self.metrics,
+            poll_interval_seconds=settings.outbox_poll_interval_seconds,
+            backoff_seconds=settings.outbox_retry_backoff_seconds,
+            backoff_max_seconds=settings.outbox_retry_backoff_max_seconds,
+        )
+
+        def _enqueue_on_audit(entry) -> None:
+            self.outbox.enqueue_audit_entry(entry)
+            if transport is not None:
+                self.relay.kick()
+
+        self.audit.add_sink(_enqueue_on_audit)
+
+    def start_relay(self) -> bool:
+        """启动后台外发中继；未配置投递端点时返回 False（仅本地留存）。"""
+
+        if self.relay.running or not self.relay.delivery_enabled:
+            return self.relay.running
+        self.relay.start()
+        return True
+
+    def stop_relay(self) -> None:
+        self.relay.stop()
+
+    def flush_outbox(self) -> dict[str, int]:
+        """立即跑一轮补齐 + 投递（CLI flush / 值班手动补发用）。"""
+
+        return self.relay.run_once()
+
+    def outbox_status(self) -> Mapping[str, Any]:
+        status = dict(self.outbox.stats())
+        status["delivery_enabled"] = self.relay.delivery_enabled
+        status["relay_running"] = self.relay.running
+        status["endpoint"] = self.settings.outbox_endpoint or None
+        return status
+
+    def outbox_pending(self, *, limit: int = 100) -> list[Mapping[str, Any]]:
+        return [record.to_dict() for record in self.outbox.pending()[:limit]]
+
+    def outbox_dead(self) -> list[Mapping[str, Any]]:
+        return [record.to_dict() for record in self.outbox.dead()]
+
+    def outbox_events(self, *, limit: int = 100) -> list[Mapping[str, Any]]:
+        from .outbox import describe_envelope
+
+        return [
+            {
+                "seq": entry.seq,
+                "written_at": entry.written_at,
+                "envelope": describe_envelope(entry.envelope),
+            }
+            for entry in self.outbox.entries(limit=limit)
+        ]
+
+    def revive_outbox_event(self, audit_seq: int) -> Mapping[str, Any]:
+        return self.outbox.revive(audit_seq).to_dict()
+
+    def outbox_reconcile(self) -> Mapping[str, Any]:
+        from .audit import AUDIT_STREAM
+
+        return self.outbox.reconcile(AUDIT_STREAM)
 
     # ------------------------------------------------------------- 动作注册
     def _build_actions(self) -> dict[str, ActionHandler]:
@@ -576,6 +663,16 @@ class Application:
         payload = dict(report.to_dict())
         payload["components"] = {component.name: component.status()["state"] for component in self.components}
         payload["audit_length"] = self.audit.length()
+        reconciliation = dict(self.outbox_reconcile())
+        payload["outbox_reconcile"] = reconciliation
+        if not reconciliation.get("ok", True):
+            payload["ok"] = False
+            for kind in ("missing", "orphan", "tampered"):
+                if reconciliation.get(kind):
+                    payload["problems"] = [
+                        *payload.get("problems", ()),
+                        f"outbox/{kind}: {reconciliation[kind]}",
+                    ]
         return payload
 
     def describe_actions(self) -> list[Mapping[str, Any]]:
